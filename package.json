@@ -1,0 +1,17 @@
+{
+  "name": "sftp-proxy",
+  "version": "0.1.0",
+  "description": "",
+  "main": "src/index.js",
+  "bin": {
+    "sftp-proxy": "src/index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "stream-buffers": "^3.0.2"
+  }
+}
