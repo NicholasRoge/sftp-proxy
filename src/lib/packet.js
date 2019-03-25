@@ -1,3 +1,9 @@
+const {Duplex} = require('stream')
+
+const {SftpStatusError} = require('./error')
+const {isInteger} = require('./util')
+
+
 const PacketType = {
     SSH_FXP_INIT: 1,
    	SSH_FXP_VERSION: 2,
@@ -58,64 +64,406 @@ const StatusCode = {
 }
 
 
-class PacketParser {
+class SftpPacketStream extends Duplex {
+    constructor(options = {}) {
+        super({
+            allowHalfOpen: false
+        })
+
+        this.onwritepacket = options.writePacket || null
+        this.onwritepacketv = options.writePacketv || null
+
+        this._inputBuffer = Buffer.alloc(0)
+    }
+
+    _read(size) {
+        this.resume()
+    }
+
+    _write(chunk, encoding, callback) {
+        let packets = []
+
+        const reader = new PacketBufferReader(Buffer.concat([
+            this._inputBuffer,
+            chunk
+        ]))
+        while (hasReadablePacket(reader)) {
+            packets.push(readPacket(reader))
+        }
+        this._inputBuffer = reader.read()
+
+        this.writePacketv(packets, callback)
+    }
+
+    _writev(chunks, callback) {
+        this._write(Buffer.concat(chunks.map(entry => entry.chunk)), "buffer", callback)
+    }
+
+    _writePacket(packet, callback) {
+        if (this.onwritepacket) {
+            return this.onwritepacket.apply(this, [packet, callback])
+        }
+
+
+        if (!this.pushPacket(packet)) {
+            this.pause()
+        }
+
+        callback()
+    }
+
+    _writePacketv(packets, callback) {
+        if (this.onwritepacketv) {
+            return this.onwritepacketv.apply(this, [packets, callback])
+        }
+
+
+        packets.reverse()
+            .map(packet => {
+                return next => this._writePacket(packet, err => {
+                    if (err) {
+                        return callback(err)
+                    }
+
+
+                    next()
+                })
+            })
+            .reduce((nextFn, currentFn) => {
+                return () => currentFn(nextFn)
+            }, () => callback())
+            .call()
+    }
+
+    pushPacket(packet) {
+
+    }
+}
+
+class PacketBufferReader {
     constructor(buffer, offset = 0) {
-        this._buffer = buffer
-        
-        this._startOffset = offset
+        Object.defineProperties(this, {
+            buffer: {
+                value: buffer,
+                configurable: false
+            },
+            startOffset: {
+                value: startOffset,
+                configurable: false
+            },
+            offset: {
+                get() {
+                    return this._offset
+                },
+
+                set(value) {
+                    this._validateOffset(value)
+
+                    this._offset = value
+                }
+            }
+        })
+
+        this._validateOffset(offset)
         this._offset = offset
+    }
+
+    get remainingByteLength() {
+        return this.buffer.byteLength - this.offset
+    }
+
+    get finished() {
+        return this.remainingByteLength <= 0
     }
 
     reset() {
-        this._offset = this._startOffset
+        this.offset = this._startOffset
     }
 
     seek(offset) {
-        this._offset = offset
+        this.offset = offset
+    }
+
+    peek(bytes = -1) {
+        if (bytes < 0) {
+            bytes = this.remainingByteLength
+        }
+
+        return this.buffer.slice(this.offset, this.offset + bytes)
     }
 
     read(bytes = -1) {
-        if (bytes < 0) {
-            bytes = this._buffer.length - this._offset
-        }
-
-        const value = this._buffer.slice(this._offset, this._offset + bytes)
+        const value = this.peek(bytes)
         this._offset += value.byteLength
         return value
     }
 
+    peekUInt8() {
+        return this.buffer.readUInt8(this.offset)
+    }
+
     readUInt8() {
-        const value = this._buffer.readUInt8(this._offset)
+        const value = this.peekUInt8()
         this._offset += 1
         return value
     }
 
+    peekUInt32() {
+        return this.buffer.readUInt32BE(this.offset)
+    }
+
     readUInt32() {
-        const value = this._buffer.readUInt32BE(this._offset)
+        const value = this.peekUInt32()
         this._offset += 4
         return value
     }
 
+    peekUInt64() {
+        return (this.buffer.readUInt32BE(this.offset) << 32) | this.buffer.readUInt32BE(this.offset + 4)
+    }
+
     readUInt64() {
-        const value = (this._buffer.readUInt32BE(this._offset) << 32) | this._buffer.readUInt32BE(this._offset + 4)
+        const value = this.peekUInt64()
         this._offset += 8
         return value
     }
 
-    readString(encoding = 'UTF-8') {
-        const valueLength = this.readUInt32()
+    peekString(encoding = 'utf8') {
+        const length = this.peekUInt32()
 
-        const value = this._buffer.toString(encoding, this._offset, this._offset + valueLength)
-        this._offset += valueLength
+        return this.buffer.toString(encoding, this.offset + 4, this.offset + 4 + length)
+    }
+
+    readString(encoding = 'utf8') {
+        const value = this.peekString(encoding)
+        this._offset += 4 + Buffer.byteLength(value, encoding)
         return value
     }
 
-    isFinished() {
-        return this._offset >= this._buffer.byteLength
+    canReadPacket() {
+        if (this.finished) {
+            return false
+        }
+    
+    
+        if (this.remainingByteLength < 5) {
+            return false
+        }
+    
+    
+        const packetPayloadSize = this.peekUInt32()
+        if (this.remainingByteLength < 5 + packetPayloadSize) {
+            return false
+        }
+    
+        return true
+    }
+
+    readPacket() {
+        if (!this.canReadPacket()) {
+            throw new SftpStatusError(StatusCode.SSH_FX_BAD_MESSAGE)
+        }
+
+
+        const packetReadStartOffset = this.offset
+        
+        const payloadLength = this.readUInt32()
+
+        const packet = {}
+        packet.type = this.readUInt8()
+        packet.payload = {}
+        switch (type) {
+            case PacketType.SSH_FXP_INIT:  {
+                payload.version = parser.readUInt32()
+                payload.extensions = {}
+                while (!parser.isFinished()) { // TODO:  Don't be lazy
+                    const extensionName = parser.readString()
+                    const extensionData = parser.readString()
+
+                    payload.extensions[extensionName] = extensionData
+                }
+                break
+
+            case PacketType.SSH_FXP_VERSION: {
+                payload.version = parser.readUInt32()
+                payload.extensions = {}
+                while (!parser.isFinished()) {
+                    const extensionName = parser.readString()
+                    const extensionData = parser.readString()
+
+                    payload.extensions[extensionName] = extensionData
+                }
+                break
+
+            case PacketType.SSH_FXP_OPEN: {
+                payload.id = parser.readUInt32()
+                payload.filename = parser.readString()
+                payload.pflags = parser.readUInt32()
+                payload.attrs = readAttributes(parser)
+                break
+
+            case PacketType.SSH_FXP_CLOSE: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_READ: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                payload.offset = parser.readUInt64()
+                payload.len = parser.readUInt32()
+                break
+
+            case PacketType.SSH_FXP_WRITE: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                payload.offset = parser.readUInt64()
+                payload.data = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_LSTAT: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_FSTAT: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_SETSTAT: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                payload.attrs = readAttributes(parser)
+                break
+
+            case PacketType.SSH_FXP_FSETSTAT: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                payload.attrs = readAttributes(parser)
+                break
+
+            case PacketType.SSH_FXP_OPENDIR: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_READDIR: {
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_REMOVE: {
+                payload.id = parser.readUInt32()
+                payload.filename = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_MKDIR: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                payload.attrs = this.readAttributes()
+                break
+
+            case PacketType.SSH_FXP_RMDIR: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_REALPATH: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_STAT: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_RENAME: {
+                payload.id = parser.readUInt32()
+                payload.oldpath = parser.readString()
+                payload.newpath = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_READLINK: {
+                payload.id = parser.readUInt32()
+                payload.path = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_SYMLINK: {
+                payload.id = parser.readUInt32()
+                payload.linkpath = parser.readString()
+                payload.targetpath = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_STATUS:
+                payload.id = parser.readUInt32()
+                payload.code = parser.readUInt32()
+                payload.message = parser.readString()
+                payload.language = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_HANDLE:
+                payload.id = parser.readUInt32()
+                payload.handle = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_DATA:
+                payload.id = parser.readUInt32()
+                payload.data = parser.readString()
+                break
+
+            case PacketType.SSH_FXP_NAME: 
+                payload.id = parser.readUInt32()
+
+                payload.names = []
+                const nameCount = parser.readUInt32()
+                for (let i = 0;i < nameCount;++i) {
+                    const name = {}
+                    name.filename = parser.readString()
+                    name.longname = parser.readString()
+                    name.attrs = this.readAttributes()
+                    payload.names = []
+                }
+                break
+
+            case PacketType.SSH_FXP_ATTRS:
+                payload.id = parser.readUInt32()
+                payload.attrs = readAttributes(parser)
+                break
+
+            case PacketType.SSH_FXP_EXTENDED:
+                payload.id = parser.readUInt32()
+                payload.extendedRequest = parser.readString()
+                payload.requestData = parser.read()
+                break
+
+            case PacketType.SSH_FXP_EXTENDED_REPLY:
+                payload.id = parser.readUInt32()
+                payload.replyData = parser.read()
+                break
+
+            default:
+                throw new SftpStatusError(StatusCode.SSH_FX_OP_UNSUPPORTED)
+        }
+    }
+
+    _validateOffset(offset) {
+        if (!isInteger(offset)) {
+            throw new RuntimeError("Offset must be a valid integer.")
+        }
+
+        if (offset < 0 || offset > this.buffer.byteLength) {
+            throw new RuntimeError("Offset out of range.")
+        }
     }
 }
 
-function readPacket(buffer, offset = 0)  {
+function hasReadablePacket(reader) {
+    
+}
+
+function readPacket(reader)  {
     const parser = new PacketParser(buffer, offset)
 
     const packetPayloadLength = parser.readUInt32()
@@ -133,290 +481,6 @@ function readPacket(buffer, offset = 0)  {
 }
 
 function readPacketPayload(type, parser) {
-    switch (type) {
-        case PacketType.SSH_FXP_INIT:  {
-            const payload = {}
-
-            payload.version = parser.readUInt32()
-
-            payload.extensions = {}
-            while (!parser.isFinished()) { // TODO:  Don't be lazy
-                const extensionName = parser.readString()
-                const extensionData = parser.readString()
-
-                payload.extensions[extensionName] = extensionData
-            }
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_VERSION: {
-            const payload = {}
-
-            payload.version = parser.readUInt32()
-
-            payload.extensions = {}
-            while (!parser.isFinished()) {
-                const extensionName = parser.readString()
-                const extensionData = parser.readString()
-
-                payload.extensions[extensionName] = extensionData
-            }
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_OPEN: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.filename = parser.readString()
-            payload.pflags = parser.readUInt32()
-            payload.attrs = readAttributes(parser)
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_CLOSE: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_READ: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-            payload.offset = parser.readUInt64()
-            payload.len = parser.readUInt32()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_WRITE: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-            payload.offset = parser.readUInt64()
-            payload.data = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_LSTAT: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_FSTAT: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_SETSTAT: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-            payload.attrs = readAttributes(parser)
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_FSETSTAT: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-            payload.attrs = readAttributes(parser)
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_OPENDIR: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_READDIR: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_REMOVE: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.filename = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_MKDIR: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-            payload.attrs = readAttributes(parser)
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_RMDIR: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_REALPATH: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_STAT: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_RENAME: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.oldpath = parser.readString()
-            payload.newpath = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_READLINK: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.path = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_SYMLINK: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.linkpath = parser.readString()
-            payload.targetpath = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_STATUS: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.code = parser.readUInt32()
-            payload.message = parser.readString()
-            payload.language = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_HANDLE: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.handle = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_DATA: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.data = parser.readString()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_NAME: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-
-            const nameCount = parser.readUInt32()
-            payload.names = []
-            for (let i = 0;i < nameCount;++i) {
-                const name = {}
-                name.filename = parser.readString()
-                name.longname = parser.readString()
-                name.attrs = readAttributes(parser)
-                payload.names = []
-            }
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_ATTRS: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.attrs = readAttributes(parser)
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_EXTENDED: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.extendedRequest = parser.readString()
-            payload.requestData = parser.read()
-
-            return payload
-        }
-
-        case PacketType.SSH_FXP_EXTENDED_REPLY: {
-            const payload = {}
-
-            payload.id = parser.readUInt32()
-            payload.replyData = parser.read()
-
-            return payload
-        }
-
-        default:
-            return buffer
-    }
 }
 
 function readAttributes(parser) {
