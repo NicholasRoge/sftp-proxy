@@ -6,9 +6,6 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "stream-buffers": "^3.0.2"
-  }
+  "author": "Nicholas Rogé <NicholasRoge@gmail.com>",
+  "license": "ISC"
 }
