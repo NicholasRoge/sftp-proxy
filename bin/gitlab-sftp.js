@@ -3,7 +3,7 @@
 const fs = require('fs')
 const {pipeline} = require('stream')
 
-const SftpServerProxy = require('../lib/SftpServerProxy')
+const {SftpServerProxy} = require('../lib/stream')
 const {PacketType} = require('../lib/constants')
 
 
@@ -19,13 +19,15 @@ const sftpServerProxy = new SftpServerProxy({
         args: ['-d', process.env.HOME]
     }
 })
-//sftpServerProxy.use(preventOpenMiddleware)
 
 pipeline(
     process.stdin,
     sftpServerProxy,
     process.stdout,
-    err => console.error(err)
+    err => {
+        debugger
+        console.error(err)
+    }
 )
 
 
