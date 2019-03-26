@@ -2,7 +2,7 @@
   "name": "sftp-proxy",
   "version": "0.1.0",
   "description": "",
-  "main": "src/index.js",
+  "main": "index.js",
   "bin": {
     "gitlab-sftp": "bin/gitlab-sftp.js"
   },
