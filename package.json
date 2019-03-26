@@ -1,5 +1,5 @@
 {
-  "name": "sftp-proxy",
+  "name": "sftp-stream",
   "version": "0.1.0",
   "description": "",
   "main": "index.js",
